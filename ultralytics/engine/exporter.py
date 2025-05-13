@@ -1101,9 +1101,46 @@ class Exporter:
         return f, None
 
     @try_export
-    def export_rknn(self, prefix=colorstr("RKNN:")):
-        """YOLO RKNN model export."""
+    def export_rknn(self, prefix=colorstr('RKNN:')):
+        """YOLOv8 RKNN model export."""
         LOGGER.info(f"\n{prefix} starting export with rknn-toolkit2...")
+
+        f = str(self.file).replace(self.file.suffix, f'.onnx')
+        torch.onnx.export(
+            self.model,
+            self.im[0:1,:,:,:],
+            f,
+            verbose=False,
+            opset_version=12,
+            do_constant_folding=True,  # WARNING: DNN inference with torch>=1.12 may require do_constant_folding=False
+            input_names=['images'])
+
+        requirements = ["onnx>=1.12.0,<1.18.0"]
+        if self.args.simplify:
+            requirements += ["onnxslim>=0.1.46", "onnxruntime" + ("-gpu" if torch.cuda.is_available() else "")]
+        check_requirements(requirements)
+        import onnx  # noqa
+
+        # Checks
+        model_onnx = onnx.load(f)  # load onnx model
+
+        # Simplify
+        if self.args.simplify:
+            try:
+                import onnxslim
+
+                LOGGER.info(f"{prefix} slimming with onnxslim {onnxslim.__version__}...")
+                model_onnx = onnxslim.slim(model_onnx)
+
+            except Exception as e:
+                LOGGER.warning(f"{prefix} simplifier failure: {e}")
+
+        # Metadata
+        for k, v in self.metadata.items():
+            meta = model_onnx.metadata_props.add()
+            meta.key, meta.value = k, str(v)
+
+        onnx.save(model_onnx, f)
 
         check_requirements("rknn-toolkit2")
         if IS_COLAB:
@@ -1114,16 +1151,59 @@ class Exporter:
 
         from rknn.api import RKNN
 
-        f, _ = self.export_onnx()
-        export_path = Path(f"{Path(f).stem}_rknn_model")
+        # 确保导出路径不会重复
+        model_name = Path(f).stem
+        export_path = Path(f"{model_name}_rknn_model")
         export_path.mkdir(exist_ok=True)
 
         rknn = RKNN(verbose=False)
         rknn.config(mean_values=[[0, 0, 0]], std_values=[[255, 255, 255]], target_platform=self.args.name)
         rknn.load_onnx(model=f)
-        rknn.build(do_quantization=self.args.int8)
-        f = f.replace(".onnx", f"-{self.args.name}-int8.rknn" if self.args.int8 else f"-{self.args.name}-fp16.rknn")
-        rknn.export_rknn(f"{export_path / f}")
+        if self.args.int8:
+            # 直接使用指定的数据集文件进行校准
+            dataset_file = getattr(self.args, 'dataset_file', '/data/home/sczc245/run/datasets/tank506/file3/sampled_images.txt')
+            
+            LOGGER.info(f"{prefix} using calibration dataset: {dataset_file}")
+
+            try:
+                # 验证文件是否存在
+                if Path(dataset_file).exists():                    
+                    # 验证文件内容是否有效
+                    with open(dataset_file, 'r') as f:
+                        lines = f.readlines()
+                        image_count = len(lines)
+                        if image_count == 0:
+                            raise ValueError("Calibration file is empty")
+                        
+                        # 验证第一个图像是否可以访问
+                        test_image_path = lines[0].strip()
+                        if not Path(test_image_path).exists():
+                            raise ValueError(f"Test image {test_image_path} not found")
+                        
+                    LOGGER.info(f"{prefix} found {image_count} calibration images")
+                    
+                    # 使用已有的校准集构建INT8模型
+                    ret = rknn.build(do_quantization=True, dataset=dataset_file)
+                else:
+                    LOGGER.warning(f"{prefix} calibration file not found: {dataset_file}, falling back to FP16")
+                    ret = rknn.build(do_quantization=False)
+            
+            except Exception as e:
+                LOGGER.warning(f"{prefix} error using calibration dataset: {e}, falling back to FP16")
+                ret = rknn.build(do_quantization=False)
+        else:
+            # 不进行量化
+            ret = rknn.build(do_quantization=False)
+        
+        # 构建输出文件名
+        quant_suffix = "-int8" if self.args.int8 and ret == 0 else "-fp16"
+        f_out = f"{model_name}-{self.args.name}{quant_suffix}.rknn"
+        
+        # 导出RKNN模型
+        output_path = export_path / f_out
+        ret = rknn.export_rknn(str(output_path))
+        
+        LOGGER.info(f"{prefix} successfully exported RKNN model to: {output_path}")
         YAML.save(export_path / "metadata.yaml", self.metadata)
         return export_path, None
 
@@ -1517,3 +1597,22 @@ class NMSModel(torch.nn.Module):
             pad = (0, 0, 0, self.args.max_det - dets.shape[0])
             out[i] = torch.nn.functional.pad(dets, pad)
         return (out[:bs], preds[1]) if self.model.task == "segment" else out[:bs]
+
+def export(cfg=DEFAULT_CFG):
+    """Export a YOLOv model to a specific format."""
+    cfg.model = cfg.model or 'yolov8n.yaml'
+    cfg.format = cfg.format or 'torchscript'
+    if cfg.format == 'rknn' and cfg.int8 and not hasattr(cfg, 'dataset_file'):
+        cfg.dataset_file = '/data/home/sczc245/run/datasets/tank506/file3/sampled_images.txt'
+    
+    from ultralytics import YOLO
+    model = YOLO(cfg.model)
+    model.export(**vars(cfg))
+
+
+if __name__ == '__main__':
+    """
+    CLI:
+    yolo mode=export model=yolov8n.yaml format=onnx
+    """
+    export()
