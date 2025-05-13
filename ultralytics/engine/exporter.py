@@ -1161,36 +1161,44 @@ class Exporter:
         rknn.load_onnx(model=f)
         if self.args.int8:
             # 直接使用指定的数据集文件进行校准
-            dataset_file = getattr(self.args, 'dataset_file', '/data/home/sczc245/run/datasets/tank506/file3/sampled_images.txt')
+            dataset_file = getattr(self.args, 'dataset_file', None)
             
-            LOGGER.info(f"{prefix} using calibration dataset: {dataset_file}")
-
-            try:
-                # 验证文件是否存在
-                if Path(dataset_file).exists():                    
-                    # 验证文件内容是否有效
-                    with open(dataset_file, 'r') as f:
-                        lines = f.readlines()
-                        image_count = len(lines)
-                        if image_count == 0:
-                            raise ValueError("Calibration file is empty")
-                        
-                        # 验证第一个图像是否可以访问
-                        test_image_path = lines[0].strip()
-                        if not Path(test_image_path).exists():
-                            raise ValueError(f"Test image {test_image_path} not found")
-                        
-                    LOGGER.info(f"{prefix} found {image_count} calibration images")
-                    
-                    # 使用已有的校准集构建INT8模型
-                    ret = rknn.build(do_quantization=True, dataset=dataset_file)
-                else:
-                    LOGGER.warning(f"{prefix} calibration file not found: {dataset_file}, falling back to FP16")
-                    ret = rknn.build(do_quantization=False)
-            
-            except Exception as e:
-                LOGGER.warning(f"{prefix} error using calibration dataset: {e}, falling back to FP16")
+            if dataset_file is None:
+                LOGGER.warning(
+                    f"{prefix} No calibration dataset specified for INT8 quantization. "
+                    f"Please provide a calibration dataset using the 'dataset_file' parameter into default.yaml. "
+                    f"Falling back to FP16 mode."
+                )
                 ret = rknn.build(do_quantization=False)
+            else:
+                LOGGER.info(f"{prefix} using calibration dataset: {dataset_file}")
+                
+                try:
+                    # 验证文件是否存在
+                    if Path(dataset_file).exists():                    
+                        # 验证文件内容是否有效
+                        with open(dataset_file, 'r') as f:
+                            lines = f.readlines()
+                            image_count = len(lines)
+                            if image_count == 0:
+                                raise ValueError("Calibration file is empty")
+                            
+                            # 验证第一个图像是否可以访问
+                            test_image_path = lines[0].strip()
+                            if not Path(test_image_path).exists():
+                                raise ValueError(f"Test image {test_image_path} not found")
+                            
+                        LOGGER.info(f"{prefix} found {image_count} calibration images")
+                        
+                        # 使用已有的校准集构建INT8模型
+                        ret = rknn.build(do_quantization=True, dataset=dataset_file)
+                    else:
+                        LOGGER.warning(f"{prefix} calibration file not found: {dataset_file}, falling back to FP16")
+                        ret = rknn.build(do_quantization=False)
+                
+                except Exception as e:
+                    LOGGER.warning(f"{prefix} error using calibration dataset: {e}, falling back to FP16")
+                    ret = rknn.build(do_quantization=False)
         else:
             # 不进行量化
             ret = rknn.build(do_quantization=False)
@@ -1603,7 +1611,9 @@ def export(cfg=DEFAULT_CFG):
     cfg.model = cfg.model or 'yolov8n.yaml'
     cfg.format = cfg.format or 'torchscript'
     if cfg.format == 'rknn' and cfg.int8 and not hasattr(cfg, 'dataset_file'):
-        cfg.dataset_file = '/data/home/sczc245/run/datasets/tank506/file3/sampled_images.txt'
+        print("WARNING: RKNN INT8 export requires a calibration dataset. "
+              "Please specify one using 'dataset_file=/path/to/calibration_images.txt'")
+        print("Example: yolo export model=best.pt format=rknn name=rk3588 int8=True dataset_file=/path/to/calibration_images.txt")
     
     from ultralytics import YOLO
     model = YOLO(cfg.model)
